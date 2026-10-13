@@ -1,0 +1,196 @@
+# Builds upstream NSSM with the toolchain upstream used. The 2.24-103 release's
+# own nssm.exe files were linked by VC++ 2008 SP1 (linker 9.0, Rich header
+# build 30729), so this builds the untouched nssm.vcproj with that compiler,
+# cl 15.00.30729.01, through vcbuild. The source comes from master (or the ref
+# given to a manual run), never from this branch.
+name: Build
+
+on:
+  push:
+    branches: [ci]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source ref to build (branch, tag or commit)
+        default: master
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  # The toolchain comes from regulad/vs, a private mirror: its license forbids
+  # publishing it (see that repository's README). Both files are pinned here
+  # as well as there, so a change to the mirror cannot silently change the
+  # compiler; each is also accepted only with a valid Microsoft signature.
+  #
+  # vc9/VCForPython27.msi: Microsoft Visual C++ Compiler for Python 2.7,
+  # VC++ 2008 SP1's compilers (x86, x64 and x86->x64), vcbuild and its project
+  # engine, and Windows SDK 7.0's headers, import libraries, rc and mc.
+  VC9_SHA256: 070474db76a2e625513a5835df4595df9324d820f9cc97eab2a596dcbc2f5cbf
+  # vc9/vcredist_x64.exe: the VC++ 2008 runtime, which vcbuild.exe needs in
+  # WinSxS and an administrative extract of the MSI does not install.
+  VCREDIST_SHA256: c5e273a4a16ab4d5471e91c7477719a2f45ddadb76c7f98a38fa5074a6838654
+
+jobs:
+  build:
+    runs-on: windows-2025
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v5.0.0
+        with:
+          ref: ${{ inputs.ref || 'master' }}
+          # version.cmd stamps the build from `git describe --tags --long`.
+          fetch-depth: 0
+          path: src
+
+      # secrets.PAT, not GITHUB_TOKEN, which cannot read another repository.
+      # It needs read access to regulad/vs's contents and nothing else.
+      - name: Require the mirror token
+        env:
+          HAS_PAT: ${{ secrets.PAT != '' }}
+        run: |
+          if ($env:HAS_PAT -ne 'true') {
+            Write-Host '::error::secrets.PAT is empty. The toolchain lives in regulad/vs, which is private, so there is nothing to fall back to. Set the PAT repository secret to a token with read access to regulad/vs contents.'
+            exit 1
+          }
+
+      # Pointers only: with lfs false, checkout leaves each LFS file as its
+      # ~130-byte pointer, whose oid is the file's SHA-256. That is what the
+      # cache is keyed on, so a runner knows whether its cached copy is current
+      # before it downloads anything. Inside the workspace, because hashFiles()
+      # matches nothing outside it and would yield a stable, wrong, empty key.
+      - name: Check out the toolchain mirror's LFS pointers
+        uses: actions/checkout@v5.0.0
+        with:
+          repository: regulad/vs
+          token: ${{ secrets.PAT }}
+          path: vs-mirror
+          lfs: false
+
+      - name: Check the pointers against the pins
+        working-directory: vs-mirror
+        run: |
+          foreach ($pin in @{ 'vc9/VCForPython27.msi' = $env:VC9_SHA256; 'vc9/vcredist_x64.exe' = $env:VCREDIST_SHA256 }.GetEnumerator()) {
+            $text = Get-Content -Raw $pin.Key
+            if ($text -notmatch '(?m)^oid sha256:([0-9a-f]{64})\r?$') { throw "$($pin.Key) is not a Git LFS pointer; the mirror's layout changed, or checkout fetched LFS objects" }
+            if ($Matches[1] -ne $pin.Value) { throw "$($pin.Key) in regulad/vs is $($Matches[1]), but this workflow pins $($pin.Value)" }
+            Write-Host "$($pin.Key): $($Matches[1])"
+          }
+
+      - name: Restore the cached toolchain
+        id: vc9
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}\vc9-dl
+          key: vc9-${{ hashFiles('vs-mirror/vc9/*') }}
+
+      - name: Fetch the toolchain from the mirror
+        if: steps.vc9.outputs.cache-hit != 'true'
+        working-directory: vs-mirror
+        run: |
+          git lfs pull --include 'vc9/*'
+          if ($LASTEXITCODE -ne 0) { throw "git lfs pull exited $LASTEXITCODE" }
+          $dl = Join-Path $env:RUNNER_TEMP 'vc9-dl'
+          New-Item -ItemType Directory -Force -Path $dl | Out-Null
+          Copy-Item vc9\VCForPython27.msi, vc9\vcredist_x64.exe $dl
+
+      - name: Save the toolchain to the cache
+        if: steps.vc9.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}\vc9-dl
+          key: ${{ steps.vc9.outputs.cache-primary-key }}
+
+      - name: Verify and unpack VC++ 2008 SP1
+        run: |
+          $dl = Join-Path $env:RUNNER_TEMP 'vc9-dl'
+          # On both paths: a cache entry is only as good as what was saved.
+          function Assert-Microsoft([string]$Name, [string]$Sha256) {
+            $file = Join-Path $dl $Name
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+            if ($hash -ne $Sha256) { throw "$Name is $hash, expected $Sha256" }
+            $sig = Get-AuthenticodeSignature $file
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch '^CN=Microsoft Corporation,') {
+              throw "$Name is not validly signed by Microsoft: $($sig.Status) $($sig.SignerCertificate.Subject)"
+            }
+            Write-Host "verified $Name ($hash, $($sig.SignerCertificate.Subject))"
+            $file
+          }
+          $msi = Assert-Microsoft 'VCForPython27.msi' $env:VC9_SHA256
+          $redist = Assert-Microsoft 'vcredist_x64.exe' $env:VCREDIST_SHA256
+
+          $p = Start-Process -FilePath $redist -ArgumentList '/q' -Wait -PassThru
+          if ($p.ExitCode -notin 0, 3010) { throw "vcredist_x64.exe exited $($p.ExitCode)" }
+
+          # An administrative extract: the files only, no install.
+          $root = Join-Path $env:RUNNER_TEMP 'vc9'
+          $p = Start-Process -FilePath msiexec.exe -ArgumentList '/a', "`"$msi`"", '/qn', "TARGETDIR=`"$root`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "msiexec /a exited $($p.ExitCode)" }
+          $vc = Join-Path $root 'Microsoft\Visual C++ for Python\9.0'
+          & "$vc\VC\bin\cl.exe" 2>&1 | Select-Object -First 1 | Write-Host
+          "VC9=$vc" | Add-Content -Path $env:GITHUB_ENV
+
+      - name: Build Release for Win32 and x64
+        working-directory: src
+        run: |
+          $vc = $env:VC9
+          # vcbuild ships only as an x64 binary; /useenv makes it take the
+          # compilers, headers and libraries from the environment set here
+          # rather than from a Visual Studio install's registry settings.
+          $vcbuild = "$vc\VC\bin\amd64\vcbuild.exe"
+          $toolchains = [ordered]@{
+            Win32 = @{ Bin = "$vc\VC\bin;$vc\WinSDK\Bin"; Lib = "$vc\VC\lib;$vc\WinSDK\Lib" }
+            x64   = @{ Bin = "$vc\VC\bin\amd64;$vc\WinSDK\Bin\x64;$vc\WinSDK\Bin"; Lib = "$vc\VC\lib\amd64;$vc\WinSDK\Lib\x64" }
+          }
+          $basePath = $env:PATH
+          foreach ($platform in $toolchains.Keys) {
+            $env:PATH = "$($toolchains[$platform].Bin);$basePath"
+            $env:INCLUDE = "$vc\VC\include;$vc\WinSDK\Include"
+            $env:LIB = $toolchains[$platform].Lib
+            $env:LIBPATH = $toolchains[$platform].Lib
+            Write-Host "::group::Release|$platform"
+            & $vcbuild /nologo /useenv nssm.vcproj "Release|$platform"
+            $code = $LASTEXITCODE
+            Write-Host '::endgroup::'
+            if ($code -ne 0) { throw "vcbuild Release|$platform exited $code" }
+          }
+
+      - name: Check the binaries
+        working-directory: src
+        run: |
+          $describe = git describe --tags --long
+          Write-Host "source: $describe"
+          foreach ($arch in @{ win32 = 0x014c; win64 = 0x8664 }.GetEnumerator()) {
+            $exe = "out\Release\$($arch.Key)\nssm.exe"
+            $b = [IO.File]::ReadAllBytes((Resolve-Path $exe))
+            $pe = [BitConverter]::ToInt32($b, 0x3c)
+            $machine = [BitConverter]::ToUInt16($b, $pe + 4)
+            $linker = '{0}.{1}' -f $b[$pe + 26], $b[$pe + 27]
+            $version = (Get-Item $exe).VersionInfo.FileVersion
+            Write-Host ("{0}: machine 0x{1:x4}, linker {2}, FileVersion {3}" -f $exe, $machine, $linker, $version)
+            if ($machine -ne $arch.Value) { throw "$exe is not a $($arch.Key) binary" }
+            if ($linker -ne '9.0') { throw "$exe was not linked by VC++ 2008" }
+          }
+
+      - name: Lay out the artifact like upstream's release zip
+        working-directory: src
+        run: |
+          $name = 'nssm-' + ((git describe --tags --long) -replace '^v', '')
+          $dest = Join-Path $env:RUNNER_TEMP "artifact\$name"
+          foreach ($arch in 'win32', 'win64') {
+            New-Item -ItemType Directory -Force -Path "$dest\$arch" | Out-Null
+            Copy-Item "out\Release\$arch\nssm.exe", "out\Release\$arch\nssm.pdb" "$dest\$arch\"
+          }
+          Copy-Item README.txt, ChangeLog.txt $dest
+          "ARTIFACT_NAME=$name" | Add-Content -Path $env:GITHUB_ENV
+          "ARTIFACT_DIR=$(Split-Path $dest)" | Add-Content -Path $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: error
