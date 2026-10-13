@@ -13,6 +13,10 @@ on:
       ref:
         description: Source ref to build (branch, tag or commit)
         default: master
+      release:
+        description: Publish the build as a GitHub release
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -49,6 +53,8 @@ env:
 jobs:
   build:
     runs-on: windows-2025
+    outputs:
+      name: ${{ steps.layout.outputs.name }}
     steps:
       - name: Check out the source
         uses: actions/checkout@v5.0.0
@@ -267,7 +273,12 @@ jobs:
             if ($linker -ne '9.0') { throw "$exe was not linked by VC++ 2008" }
           }
 
+      # nssm-<describe>\ with win32\ and win64\ (nssm.exe, nssm.pdb), src\ (the
+      # source tree but for the two text files, which sit at the top) and
+      # README.txt and ChangeLog.txt: the shape of upstream's own zips, so the
+      # Scoop manifest's extract_dir is the one it always was.
       - name: Lay out the artifact like upstream's release zip
+        id: layout
         working-directory: src
         run: |
           $name = 'nssm-' + ((git describe --tags --long) -replace '^v', '')
@@ -277,11 +288,61 @@ jobs:
             Copy-Item "out\Release\$arch\nssm.exe", "out\Release\$arch\nssm.pdb" "$dest\$arch\"
           }
           Copy-Item README.txt, ChangeLog.txt $dest
-          "ARTIFACT_NAME=$name" | Add-Content -Path $env:GITHUB_ENV
+          $srcZip = Join-Path $env:RUNNER_TEMP 'src.zip'
+          git archive --format=zip -o $srcZip HEAD -- . ':(exclude)README.txt' ':(exclude)ChangeLog.txt'
+          if ($LASTEXITCODE -ne 0) { throw "git archive exited $LASTEXITCODE" }
+          Expand-Archive -Path $srcZip -DestinationPath "$dest\src"
+          Write-Host "${name}: $((Get-ChildItem $dest -Recurse -File).Count) files"
           "ARTIFACT_DIR=$(Split-Path $dest)" | Add-Content -Path $env:GITHUB_ENV
+          "name=$name" | Add-Content -Path $env:GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
+          name: ${{ steps.layout.outputs.name }}
           path: ${{ env.ARTIFACT_DIR }}
           if-no-files-found: error
+
+  # Only on a manual run with `release` ticked. The tag is the zip's name,
+  # nssm-<describe>, and it goes on this pipeline's commit (GITHUB_SHA), never
+  # on the source: a tag on master would become the nearest tag `git describe`
+  # finds there, and version.cmd would stamp every later build with it. A tag
+  # that already exists makes `gh release create` fail rather than replace a
+  # published release. The .sha256 sidecar is what the regulad bucket's
+  # autoupdate reads.
+  release:
+    needs: build
+    if: ${{ inputs.release }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      NAME: ${{ needs.build.outputs.name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.name }}
+          path: artifact
+
+      - name: Package and release
+        shell: bash
+        run: |
+          set -eu
+          (cd artifact && zip -q -r -X "../$NAME.zip" "$NAME")
+          hash=$(sha256sum "$NAME.zip" | cut -d' ' -f1)
+          printf '%s  %s' "$hash" "$NAME.zip" > "$NAME.zip.sha256"
+          echo "$NAME.zip: $(stat -c %s "$NAME.zip") bytes, sha256 $hash"
+          version=${NAME#nssm-}
+          notes=$(cat <<EOF
+          Upstream NSSM ${version}, built from the untouched source at [\`${version##*-g}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${version##*-g}) with the toolchain upstream used: VC++ 2008 SP1 (\`cl\` 15.00.30729.01), through \`vcbuild\` and the original \`nssm.vcproj\`. Laid out like upstream's own zip: \`win32\`, \`win64\` (each \`nssm.exe\` and \`nssm.pdb\`), \`src\`, \`README.txt\` and \`ChangeLog.txt\`. The x64 build runs under emulation on Windows on Arm.
+
+          SHA-256: \`${hash}\`
+
+          Built by [run ${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) at [\`${GITHUB_SHA:0:7}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}). Upstream: https://nssm.cc/
+          EOF
+          )
+          gh release create "$NAME" "$NAME.zip" "$NAME.zip.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "NSSM $version" \
+            --notes "$notes"
