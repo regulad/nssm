@@ -23,9 +23,10 @@ defaults:
 
 env:
   # The toolchain comes from regulad/vs, a private mirror: its license forbids
-  # publishing it (see that repository's README). Both files are pinned here
-  # as well as there, so a change to the mirror cannot silently change the
-  # compiler; each is also accepted only with a valid Microsoft signature.
+  # publishing it (see that repository's README). Every file is pinned here as
+  # well as there, so a change to the mirror cannot silently change the
+  # compiler, and every installer is also accepted only with a valid Microsoft
+  # signature.
   #
   # vc9/VCForPython27.msi: Microsoft Visual C++ Compiler for Python 2.7,
   # VC++ 2008 SP1's compilers (x86, x64 and x86->x64), vcbuild and its project
@@ -34,6 +35,16 @@ env:
   # vc9/vcredist_x64.exe: the VC++ 2008 runtime, which vcbuild.exe needs in
   # WinSxS and an administrative extract of the MSI does not install.
   VCREDIST_SHA256: c5e273a4a16ab4d5471e91c7477719a2f45ddadb76c7f98a38fa5074a6838654
+  # vc9/VS2008ExpressWithSP1ENUX1504728.iso: VS 2008 Express SP1, the whole
+  # image. It is here for VS 2008's VC\VCProjectDefaults, without which
+  # vcbuild cannot load a .vcproj and which the compiler package lacks. An
+  # image carries no signature; the installers taken out of it do.
+  EXPRESS_ISO_SHA256: 6d3b5eedfa461969c5d645871b53002d162a2e238486900d2fdf71774d53fb91
+  # What comes out of the image: the 24 project defaults, as SHA-256 of the
+  # "<sha256>  <name>" lines, one per file, ordinal-sorted by name and joined
+  # with LF. A check on the extraction, which a pinned image makes
+  # deterministic.
+  VCPD_SHA256: 50513929be84bc5f5a991cace9107b0644a6b1f0d3ccbfcb5b5f46183f4372c1
 
 jobs:
   build:
@@ -74,7 +85,12 @@ jobs:
       - name: Check the pointers against the pins
         working-directory: vs-mirror
         run: |
-          foreach ($pin in @{ 'vc9/VCForPython27.msi' = $env:VC9_SHA256; 'vc9/vcredist_x64.exe' = $env:VCREDIST_SHA256 }.GetEnumerator()) {
+          $pins = @{
+            'vc9/VCForPython27.msi' = $env:VC9_SHA256
+            'vc9/vcredist_x64.exe' = $env:VCREDIST_SHA256
+            'vc9/VS2008ExpressWithSP1ENUX1504728.iso' = $env:EXPRESS_ISO_SHA256
+          }
+          foreach ($pin in $pins.GetEnumerator()) {
             $text = Get-Content -Raw $pin.Key
             if ($text -notmatch '(?m)^oid sha256:([0-9a-f]{64})\r?$') { throw "$($pin.Key) is not a Git LFS pointer; the mirror's layout changed, or checkout fetched LFS objects" }
             if ($Matches[1] -ne $pin.Value) { throw "$($pin.Key) in regulad/vs is $($Matches[1]), but this workflow pins $($pin.Value)" }
@@ -96,7 +112,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "git lfs pull exited $LASTEXITCODE" }
           $dl = Join-Path $env:RUNNER_TEMP 'vc9-dl'
           New-Item -ItemType Directory -Force -Path $dl | Out-Null
-          Copy-Item vc9\VCForPython27.msi, vc9\vcredist_x64.exe $dl
+          # The whole image is cached, not the 24 small files taken from it:
+          # the cache entry should not depend on today's extraction list, and
+          # LFS bandwidth, not storage, is the cost a cache miss pays.
+          Copy-Item vc9\VCForPython27.msi, vc9\vcredist_x64.exe, vc9\VS2008ExpressWithSP1ENUX1504728.iso $dl
 
       - name: Save the toolchain to the cache
         if: steps.vc9.outputs.cache-hit != 'true'
@@ -122,6 +141,10 @@ jobs:
           }
           $msi = Assert-Microsoft 'VCForPython27.msi' $env:VC9_SHA256
           $redist = Assert-Microsoft 'vcredist_x64.exe' $env:VCREDIST_SHA256
+          $iso = Join-Path $dl 'VS2008ExpressWithSP1ENUX1504728.iso'
+          $isoHash = (Get-FileHash $iso -Algorithm SHA256).Hash.ToLower()
+          if ($isoHash -ne $env:EXPRESS_ISO_SHA256) { throw "VS2008ExpressWithSP1ENUX1504728.iso is $isoHash, expected $env:EXPRESS_ISO_SHA256" }
+          Write-Host "verified VS2008ExpressWithSP1ENUX1504728.iso ($isoHash)"
 
           $p = Start-Process -FilePath $redist -ArgumentList '/q' -Wait -PassThru
           if ($p.ExitCode -notin 0, 3010) { throw "vcredist_x64.exe exited $($p.ExitCode)" }
@@ -133,6 +156,74 @@ jobs:
           $vc = Join-Path $root 'Microsoft\Visual C++ for Python\9.0'
           & "$vc\VC\bin\cl.exe" 2>&1 | Select-Object -First 1 | Write-Host
           "VC9=$vc" | Add-Content -Path $env:GITHUB_ENV
+
+      # vcbuild cannot load a .vcproj without VS 2008's system property sheets,
+      # and the compiler package has none. They come out of the Express image:
+      # VCExpress\Ixpvc.exe unpacks to vs_setup.msi and vs_setup.cab, the cab
+      # names each file by its key in the MSI's File table, and the files
+      # wanted are those whose component installs to VCProjectDefaults. The
+      # package's vcbuild sits in VC\bin\amd64, so it takes $(VCInstallDir) to
+      # be VC\bin\ and looks for them in VC\bin\VCProjectDefaults.
+      - name: Extract VS 2008's project defaults from the Express image
+        run: |
+          $iso = Join-Path $env:RUNNER_TEMP 'vc9-dl\VS2008ExpressWithSP1ENUX1504728.iso'
+          $work = Join-Path $env:RUNNER_TEMP 'vcexpress'
+          $dest = "$env:VC9\VC\bin\VCProjectDefaults"
+
+          function Assert-MicrosoftSigned([string]$File) {
+            $sig = Get-AuthenticodeSignature $File
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch '^CN=Microsoft Corporation,') {
+              throw "$File is not validly signed by Microsoft: $($sig.Status) $($sig.SignerCertificate.Subject)"
+            }
+          }
+
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          7z e -y -bso0 -bsp0 "-o$work" $iso 'VCExpress/Ixpvc.exe'
+          if ($LASTEXITCODE -ne 0) { throw "7z could not take VCExpress\Ixpvc.exe out of the image ($LASTEXITCODE)" }
+          7z x -y -bso0 -bsp0 "-o$work\ixpvc" "$work\Ixpvc.exe"
+          if ($LASTEXITCODE -ne 0) { throw "7z could not unpack Ixpvc.exe ($LASTEXITCODE)" }
+          $msi = "$work\ixpvc\vs_setup.msi"
+          $cab = "$work\ixpvc\vs_setup.cab"
+          foreach ($f in "$work\Ixpvc.exe", $msi, $cab) { Assert-MicrosoftSigned $f }
+
+          # The Windows Installer COM object, driven from Windows PowerShell 5.1
+          # with plain-text output so nothing but the rows comes back.
+          $query = Join-Path $work 'vcprojectdefaults.ps1'
+          Set-Content -Path $query -Value @'
+          param([string]$Msi)
+          $wi = New-Object -ComObject WindowsInstaller.Installer
+          $db = $wi.OpenDatabase($Msi, 0)
+          function Rows([string]$Sql) { $v = $db.OpenView($Sql); [void]$v.Execute(); while ($r = $v.Fetch()) { ,$r } }
+          $dirName = @{}; foreach ($r in Rows 'SELECT Directory, DefaultDir FROM Directory') { $dirName[$r.StringData(1)] = (($r.StringData(2) -split ':')[-1] -split '\|')[-1] }
+          $dirOf = @{}; foreach ($r in Rows 'SELECT Component, Directory_ FROM Component') { $dirOf[$r.StringData(1)] = $r.StringData(2) }
+          foreach ($r in Rows 'SELECT File, Component_, FileName, FileSize FROM File') {
+            if ($dirName[$dirOf[$r.StringData(2)]] -eq 'VCProjectDefaults') {
+              '{0}|{1}|{2}' -f $r.StringData(1), ($r.StringData(3) -split '\|')[-1], $r.IntegerData(4)
+            }
+          }
+          '@
+          $rows = @(powershell.exe -NoProfile -NonInteractive -OutputFormat Text -File $query -Msi $msi)
+          if ($LASTEXITCODE -ne 0) { throw "reading vs_setup.msi's tables failed ($LASTEXITCODE)" }
+          $files = @($rows | Where-Object { $_ -match '^[^|]+\|[^|]+\|\d+$' } | ForEach-Object { $k, $n, $s = $_ -split '\|'; [pscustomobject]@{ Key = $k; Name = $n; Size = [long]$s } })
+          if ($files.Count -eq 0) { throw "vs_setup.msi lists no files under VCProjectDefaults:`n$($rows -join "`n")" }
+
+          $raw = Join-Path $work 'cab'
+          7z e -y -bso0 -bsp0 "-o$raw" $cab @($files.Key)
+          if ($LASTEXITCODE -ne 0) { throw "7z could not extract the project defaults from vs_setup.cab ($LASTEXITCODE)" }
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          foreach ($f in $files) {
+            $src = Join-Path $raw $f.Key
+            if (-not (Test-Path $src)) { throw "vs_setup.cab has no $($f.Key) ($($f.Name))" }
+            if ((Get-Item $src).Length -ne $f.Size) { throw "$($f.Name) is $((Get-Item $src).Length) bytes, vs_setup.msi says $($f.Size)" }
+            Copy-Item $src (Join-Path $dest $f.Name)
+          }
+
+          $names = [string[]](Get-ChildItem $dest -File | ForEach-Object Name)
+          [Array]::Sort($names, [StringComparer]::Ordinal)
+          $listing = ($names | ForEach-Object { '{0}  {1}' -f (Get-FileHash (Join-Path $dest $_) -Algorithm SHA256).Hash.ToLower(), $_ }) -join "`n"
+          $digest = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($listing))).Replace('-', '').ToLower()
+          if ($digest -ne $env:VCPD_SHA256) { throw "the $($names.Count) extracted project defaults digest to $digest, expected $env:VCPD_SHA256" }
+          Write-Host "installed $($names.Count) project defaults in $dest ($digest)"
 
       - name: Build Release for Win32 and x64
         working-directory: src
